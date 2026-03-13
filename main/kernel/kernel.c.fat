@@ -1,0 +1,327 @@
+// kernel.c - NedoOS with FAT support
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
+
+// VGA
+#define VGA_WIDTH 80
+#define VGA_HEIGHT 25
+#define VGA_MEMORY ((uint16_t*)0xB8000)
+
+static uint16_t* terminal_buffer = VGA_MEMORY;
+static int row = 0;
+static int col = 0;
+static uint8_t color = 0x07;
+
+static uint16_t entry(char c, uint8_t color) {
+    return (uint16_t)c | ((uint16_t)color << 8);
+}
+
+void clear_screen(void) {
+    for (int y = 0; y < VGA_HEIGHT; y++) {
+        for (int x = 0; x < VGA_WIDTH; x++) {
+            terminal_buffer[y * VGA_WIDTH + x] = entry(' ', color);
+        }
+    }
+    row = 0;
+    col = 0;
+}
+
+void putchar(char c) {
+    if (c == '\n') {
+        col = 0;
+        row++;
+        return;
+    }
+    if (c == '\b' && col > 0) {
+        col--;
+        terminal_buffer[row * VGA_WIDTH + col] = entry(' ', color);
+        return;
+    }
+    
+    terminal_buffer[row * VGA_WIDTH + col] = entry(c, color);
+    col++;
+    if (col >= VGA_WIDTH) {
+        col = 0;
+        row++;
+    }
+}
+
+void print(const char* str) {
+    for (int i = 0; str[i] != '\0'; i++) {
+        putchar(str[i]);
+    }
+}
+
+// Keyboard
+#define KEY_DATA 0x60
+#define KEY_STATUS 0x64
+
+static uint8_t inb(uint16_t port) {
+    uint8_t result;
+    __asm__ volatile("inb %1, %0" : "=a"(result) : "Nd"(port));
+    return result;
+}
+
+static char scancode_to_char(char scancode) {
+    const char layout[] = {
+        0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+        '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
+        0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
+        0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,
+        '*', 0, ' '
+    };
+    return (scancode < sizeof(layout)) ? layout[scancode] : 0;
+}
+
+char getchar(void) {
+    char scancode, c;
+    do {
+        while ((inb(KEY_STATUS) & 1) == 0);
+        scancode = inb(KEY_DATA);
+        c = scancode_to_char(scancode);
+    } while (c == 0);
+    return c;
+}
+
+// FAT structures (упрощённо)
+typedef struct {
+    uint8_t name[8];
+    uint8_t ext[3];
+    uint8_t attributes;
+    uint8_t reserved[10];
+    uint16_t time;
+    uint16_t date;
+    uint16_t cluster;
+    uint32_t size;
+} __attribute__((packed)) fat_entry_t;
+
+// ATA functions (declarations)
+int ata_read_sector(uint32_t lba, uint8_t* buffer);
+
+// Global state
+static int fat_mounted = 0;
+static uint32_t fat_root_sector = 0;
+static uint32_t fat_data_sector = 0;
+static uint16_t bytes_per_sector = 512;
+
+// Command line
+char cmd[256];
+int pos = 0;
+
+// Simple string comparison
+int strcmp(const char* s1, const char* s2) {
+    while (*s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+    }
+    return *(unsigned char*)s1 - *(unsigned char*)s2;
+}
+
+void mount_fat(void) {
+    uint8_t sector[512];
+    
+    print("\nMounting FAT...\n");
+    
+    // Read boot sector
+    if (ata_read_sector(0, sector) != 0) {
+        print("❌ Failed to read disk\n");
+        return;
+    }
+    
+    // Check FAT signature
+    if (sector[54] == 'F' && sector[55] == 'A' && sector[56] == 'T') {
+        print("✅ FAT12/16 detected\n");
+        
+        // Parse boot sector (упрощённо)
+        uint16_t reserved_sectors = *(uint16_t*)(sector + 14);
+        uint8_t fat_count = sector[16];
+        uint16_t root_entries = *(uint16_t*)(sector + 17);
+        uint16_t sectors_per_fat = *(uint16_t*)(sector + 22);
+        bytes_per_sector = *(uint16_t*)(sector + 11);
+        
+        // Calculate positions
+        uint32_t fat_start = reserved_sectors;
+        uint32_t root_start = fat_start + fat_count * sectors_per_fat;
+        uint32_t root_size = (root_entries * 32 + bytes_per_sector - 1) / bytes_per_sector;
+        fat_root_sector = root_start;
+        fat_data_sector = root_start + root_size;
+        
+        print("  FAT start: ");
+        // print hex would be better, but for now:
+        print("OK\n");
+        
+        fat_mounted = 1;
+    } else {
+        print("❌ Not a FAT disk\n");
+    }
+}
+
+void list_files(void) {
+    if (!fat_mounted) {
+        print("\n⚠️  Not mounted. Type 'mount'\n");
+        return;
+    }
+    
+    print("\n");
+    
+    uint8_t sector[512];
+    fat_entry_t* entry;
+    
+    // Read root directory first sector
+    if (ata_read_sector(fat_root_sector, sector) != 0) {
+        print("❌ Failed to read root directory\n");
+        return;
+    }
+    
+    // List files (first 16 entries for simplicity)
+    for (int i = 0; i < 16; i++) {
+        entry = (fat_entry_t*)(sector + i * 32);
+        
+        if (entry->name[0] == 0) break;
+        if (entry->name[0] == 0xE5) continue;
+        
+        // Print filename (упрощённо)
+        for (int j = 0; j < 8 && entry->name[j] != ' '; j++) {
+            putchar(entry->name[j]);
+        }
+        if (entry->ext[0] != ' ') {
+            putchar('.');
+            for (int j = 0; j < 3 && entry->ext[j] != ' '; j++) {
+                putchar(entry->ext[j]);
+            }
+        }
+        
+        print(" (");
+        
+        // Print size
+        uint32_t size = entry->size;
+        char size_str[12];
+        int k = 0;
+        if (size == 0) {
+            size_str[k++] = '0';
+        } else {
+            while (size > 0) {
+                size_str[k++] = '0' + (size % 10);
+                size /= 10;
+            }
+            // Reverse
+            for (int j = 0; j < k/2; j++) {
+                char tmp = size_str[j];
+                size_str[j] = size_str[k-1-j];
+                size_str[k-1-j] = tmp;
+            }
+        }
+        size_str[k] = '\0';
+        print(size_str);
+        print(" bytes)\n");
+    }
+}
+
+void cat_file(const char* filename) {
+    if (!fat_mounted) {
+        print("\n⚠️  Not mounted. Type 'mount'\n");
+        return;
+    }
+    
+    print("\n");
+    
+    uint8_t sector[512];
+    fat_entry_t* entry;
+    uint32_t file_size = 0;
+    uint16_t first_cluster = 0;
+    
+    // Find file in root directory
+    if (ata_read_sector(fat_root_sector, sector) != 0) {
+        print("❌ Failed to read root directory\n");
+        return;
+    }
+    
+    for (int i = 0; i < 16; i++) {
+        entry = (fat_entry_t*)(sector + i * 32);
+        
+        if (entry->name[0] == 0) break;
+        if (entry->name[0] == 0xE5) continue;
+        
+        // Compare first char (упрощённо)
+        if (entry->name[0] == filename[0]) {
+            file_size = entry->size;
+            first_cluster = entry->cluster;
+            break;
+        }
+    }
+    
+    if (first_cluster == 0) {
+        print("❌ File not found\n");
+        return;
+    }
+    
+    // Read first cluster (упрощённо - только один сектор)
+    uint32_t first_sector = fat_data_sector + (first_cluster - 2);
+    if (ata_read_sector(first_sector, sector) != 0) {
+        print("❌ Failed to read file\n");
+        return;
+    }
+    
+    // Print file content
+    for (uint32_t i = 0; i < file_size && i < 512; i++) {
+        putchar(sector[i]);
+    }
+    print("\n");
+}
+
+void handle_command(char* cmd) {
+    if (strcmp(cmd, "help") == 0) {
+        print("\nCommands:\n");
+        print("  help    - this help\n");
+        print("  clear   - clear screen\n");
+        print("  mount   - mount FAT floppy\n");
+        print("  ls      - list files\n");
+        print("  cat     - view file (cat filename)\n");
+    }
+    else if (strcmp(cmd, "clear") == 0) {
+        clear_screen();
+    }
+    else if (strcmp(cmd, "mount") == 0) {
+        mount_fat();
+    }
+    else if (strcmp(cmd, "ls") == 0) {
+        list_files();
+    }
+    else if (cmd[0] == 'c' && cmd[1] == 'a' && cmd[2] == 't' && cmd[3] == ' ') {
+        cat_file(cmd + 4);
+    }
+    else if (cmd[0] != '\0') {
+        print("\nUnknown command: ");
+        print(cmd);
+    }
+    print("\n> ");
+}
+
+void kernel_main(void) {
+    clear_screen();
+    print("NedoOS v0.2 with FAT\n");
+    print("Type 'help' for commands\n");
+    print("> ");
+    
+    while (1) {
+        char c = getchar();
+        
+        if (c == '\n') {
+            print("\n");
+            cmd[pos] = '\0';
+            handle_command(cmd);
+            pos = 0;
+        }
+        else if (c == '\b') {
+            if (pos > 0) {
+                pos--;
+                putchar('\b');
+            }
+        }
+        else {
+            cmd[pos++] = c;
+            putchar(c);
+        }
+    }
+}

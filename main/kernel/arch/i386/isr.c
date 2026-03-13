@@ -55,7 +55,7 @@ void irq_handler(struct regs *r) {
         int irq = r->int_no - 32;
         
         // Call the handler if it exists
-        if (irq_handlers[irq] != 0) {
+        if (irq_handlers[irq]) {
             irq_handlers[irq](r);
         }
         
@@ -68,12 +68,13 @@ void irq_handler(struct regs *r) {
 }
 
 // Register an IRQ handler
-void irq_register_handler(int irq, void (*handler)(struct regs *)) {
+static void (*irq_handlers[16])(struct regs*);
+
+void irq_register_handler(int irq, void (*handler)(struct regs*)) {
     if (irq >= 0 && irq < 16) {
         irq_handlers[irq] = handler;
     }
 }
-
 // Unregister an IRQ handler
 void irq_unregister_handler(int irq) {
     if (irq >= 0 && irq < 16) {

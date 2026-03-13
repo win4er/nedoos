@@ -1,0 +1,19 @@
+CC=i686-elf-gcc
+AR=i686-elf-ar
+CFLAGS=-ffreestanding -O2 -g -Wall -Wextra -Iinclude -I../kernel/include
+LIBK_OBJS=stdio/printf.o stdio/putchar.o stdio/puts.o \
+          stdlib/abort.o string/memcmp.o string/memcpy.o \
+          string/memmove.o string/memset.o string/strlen.o
+
+all: libk.a
+
+%.o: %.c
+	$(CC) -c $< -o $@ -std=gnu11 $(CFLAGS) -D__is_libk
+
+libk.a: $(LIBK_OBJS)
+	$(AR) rcs $@ $(LIBK_OBJS)
+
+clean:
+	rm -f $(LIBK_OBJS) libk.a
+
+.PHONY: all clean
