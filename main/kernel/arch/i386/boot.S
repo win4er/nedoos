@@ -1,21 +1,22 @@
-.section .multiboot
+/* Только мультизагрузочный заголовок, ничего лишнего */
+.section .multiboot, "a"
 .align 4
-    .long 0x1BADB002      // magic
-    .long 0x00            // flags
-    .long -0x1BADB002     // checksum
+    .long 0x1BADB002
+    .long 0x00
+    .long -0x1BADB002
 
-.section .bss
+/* Стек */
+.section .bss, "aw", @nobits
 .align 16
 stack_bottom:
     .skip 16384
 stack_top:
 
-.section .text
+/* Точка входа */
+.section .text, "ax"
 .global _start
 _start:
-    movl $stack_top, %esp
+    mov $stack_top, %esp
     call kernel_main
     cli
     hlt
-.Lhang:
-    jmp .Lhang
