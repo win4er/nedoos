@@ -1,7 +1,29 @@
-// NedoOS - Полная версия (без многозадачности)
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
+// NedoOS - Мега-версия с виртуальными терминалами и мышью
+#include <stdint.h>
+#include <stddef.h>
+
+// ==================== АТРИБУТЫ FAT ====================
+#define ATTR_READ_ONLY  0x01
+#define ATTR_HIDDEN     0x02
+#define ATTR_SYSTEM     0x04
+#define ATTR_VOLUME_ID  0x08
+#define ATTR_DIRECTORY  0x10
+#define ATTR_ARCHIVE    0x20
+#define ATTR_VFAT       0x0F
+
+// ==================== ENV ====================
+#define MAX_ENV 32
+#define ENV_NAME_LEN 32
+#define ENV_VALUE_LEN 128
+#define MAX_MATCHES 64
+#define ATTR_VFAT 0x0F
+
+static char env_names[MAX_ENV][ENV_NAME_LEN];
+static char env_values[MAX_ENV][ENV_VALUE_LEN];
+static int env_count = 0;
+
+static char* tab_matches[MAX_MATCHES];
+static int tab_count = 0;
 
 // ==================== VGA ====================
 #define VGA_WIDTH 80
@@ -31,7 +53,7 @@ void newline(void) {
         for (int i = 0; i < (VGA_HEIGHT-1) * VGA_WIDTH; i++) {
             video[i] = video[i + VGA_WIDTH];
         }
-        for (int i = (VGA_HEIGHT-1) * VGA_WIDTH; i < VGA_HEIGHT * VGA_WIDTH; i++) {
+for (int i = (VGA_HEIGHT-1) * VGA_WIDTH; i < VGA_HEIGHT * VGA_WIDTH; i++) {
             video[i] = ' ' | (current_color << 8);
         }
         row = VGA_HEIGHT - 1;
@@ -82,12 +104,80 @@ void outw(uint16_t port, uint16_t val) {
     __asm__ volatile("outw %0, %1" : : "a"(val), "Nd"(port));
 }
 
+// ==================== ВИРТУАЛЬНЫЕ ТЕРМИНАЛЫ ====================
+#define MAX_TERMINALS 4
+typedef struct {
+    uint16_t buffer[VGA_WIDTH * VGA_HEIGHT];
+    int row, col;
+    uint8_t color;
+    char cmd[256];
+    int pos;
+} terminal_t;
+
+static terminal_t terminals[MAX_TERMINALS];
+static int current_terminal = 0;
+
+void vt_init(void) {
+    for (int t = 0; t < MAX_TERMINALS; t++) {
+        terminals[t].row = 0;
+        terminals[t].col = 0;
+        terminals[t].color = 0x07;
+        terminals[t].pos = 0;
+        terminals[t].cmd[0] = 0;
+        // Очищаем буфер
+        for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+            terminals[t].buffer[i] = ' ' | (0x07 << 8);
+        }
+    }
+}
+
+void vt_save_current(void) {
+    terminals[current_terminal].row = row;
+    terminals[current_terminal].col = col;
+    terminals[current_terminal].color = current_color;
+    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+        terminals[current_terminal].buffer[i] = video[i];
+    }
+}
+
+void vt_restore(int term) {
+    row = terminals[term].row;
+    col = terminals[term].col;
+    current_color = terminals[term].color;
+    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+        video[i] = terminals[term].buffer[i];
+    }
+}
+
+void vt_switch(int term) {
+    if (term < 0 || term >= MAX_TERMINALS || term == current_terminal) return;
+    vt_save_current();
+    current_terminal = term;
+    vt_restore(term);
+}
+
 // ==================== KEYBOARD ====================
 #define KEY_DATA 0x60
 #define KEY_STATUS 0x64
 
 static int shift = 0;
 static int caps = 0;
+static int alt = 0;
+static int ctrl = 0;
+
+// Для истории команд
+#define MAX_HISTORY 16
+#define MAX_CMD_LEN 256
+static char history[MAX_HISTORY][MAX_CMD_LEN];
+static int history_count = 0;
+static int history_pos = -1;
+
+// Для мыши
+static int mouse_x = 40;
+static int mouse_y = 12;
+static int mouse_buttons = 0;
+static int mouse_present = 0;
+static uint16_t mouse_bg = 0;
 
 char getchar(void) {
     uint8_t sc;
@@ -95,9 +185,31 @@ char getchar(void) {
     while ((inb(KEY_STATUS) & 1) == 0);
     sc = inb(KEY_DATA);
     
+    // Alt
+    if (sc == 0x38) { alt = 1; return 0; }
+    if (sc == 0xB8) { alt = 0; return 0; }
+    // Ctrl
+    if (sc == 0x1D) { ctrl = 1; return 0; }
+    if (sc == 0x9D) { ctrl = 0; return 0; }
+    // Shift
     if (sc == 0x2A || sc == 0x36) { shift = 1; return 0; }
     if (sc == 0xAA || sc == 0xB6) { shift = 0; return 0; }
+    // Caps
     if (sc == 0x3A) { caps = !caps; return 0; }
+    
+    // F1-F4 для переключения терминалов
+    if (sc == 0x3B && alt) { vt_switch(0); return 0; } // Alt+F1
+    if (sc == 0x3C && alt) { vt_switch(1); return 0; } // Alt+F2
+    if (sc == 0x3D && alt) { vt_switch(2); return 0; } // Alt+F3
+    if (sc == 0x3E && alt) { vt_switch(3); return 0; } // Alt+F4
+    
+    // Стрелки для истории
+    if (sc == 0x48 && alt) return 0x80; // Alt+Up
+    if (sc == 0x50 && alt) return 0x81; // Alt+Down
+    
+    // Tab
+    if (sc == 0x0F) return '\t';
+    
     if (sc & 0x80) return 0;
     
     const char small[] = {
@@ -123,6 +235,54 @@ char getchar(void) {
     return 0;
 }
 
+// ==================== MOUSE ====================
+void mouse_init(void) {
+    // Включение мыши
+    outb(0x64, 0xA8);
+    outb(0x64, 0x20);
+    uint8_t status = inb(0x60);
+    status |= 2;
+    outb(0x64, 0x60);
+    outb(0x60, status);
+    
+    // Включаем передачу данных мыши
+    outb(0x64, 0xD4);
+    outb(0x60, 0xF4);
+    
+    mouse_present = 1;
+    print("Mouse initialized\n");
+}
+
+void mouse_handler(void) {
+    static int cycle = 0;
+    static uint8_t mouse_data[3];
+    
+    mouse_data[cycle] = inb(0x60);
+    cycle = (cycle + 1) % 3;
+    
+    if (cycle == 0) {
+        // Восстанавливаем фон под курсором
+        video[mouse_y * VGA_WIDTH + mouse_x] = mouse_bg;
+        
+        // Обработка данных мыши
+        mouse_buttons = mouse_data[0] & 7;
+        int dx = (int8_t)mouse_data[1];
+        int dy = -(int8_t)mouse_data[2];
+        
+        mouse_x += dx / 2;
+        mouse_y += dy / 2;
+        
+        if (mouse_x < 0) mouse_x = 0;
+        if (mouse_x >= VGA_WIDTH) mouse_x = VGA_WIDTH - 1;
+        if (mouse_y < 0) mouse_y = 0;
+        if (mouse_y >= VGA_HEIGHT) mouse_y = VGA_HEIGHT - 1;
+        
+        // Сохраняем фон и рисуем курсор
+        mouse_bg = video[mouse_y * VGA_WIDTH + mouse_x];
+        video[mouse_y * VGA_WIDTH + mouse_x] = 0xDB0F; // Белый квадрат
+    }
+}
+
 // ==================== STRING ====================
 int strcmp(const char* a, const char* b) {
     while (*a && *a == *b) { a++; b++; }
@@ -132,6 +292,50 @@ int strcmp(const char* a, const char* b) {
 void strcpy(char* dest, const char* src) {
     while (*src) *dest++ = *src++;
     *dest = 0;
+}
+
+int strlen(const char* s) {
+    int len = 0;
+    while (s[len]) len++;
+    return len;
+}
+
+int strncmp(const char* a, const char* b, int n) {
+    for (int i = 0; i < n; i++) {
+        if (a[i] != b[i]) return a[i] - b[i];
+        if (a[i] == 0) return 0;
+    }
+    return 0;
+}
+
+// ==================== ИСТОРИЯ КОМАНД ====================
+void history_add(const char* cmd) {
+    if (cmd[0] == 0) return;
+    
+    // Не добавляем дубликаты
+    if (history_count > 0 && strcmp(history[history_count-1], cmd) == 0)
+        return;
+    
+    strcpy(history[history_count % MAX_HISTORY], cmd);
+    history_count++;
+    history_pos = history_count;
+}
+
+const char* history_get_prev(void) {
+    if (history_count == 0) return NULL;
+    if (history_pos > 0) history_pos--;
+    if (history_pos < 0) history_pos = 0;
+    if (history_pos >= history_count) history_pos = history_count - 1;
+    
+    return history[history_pos % MAX_HISTORY];
+}
+
+const char* history_get_next(void) {
+    if (history_count == 0) return NULL;
+    history_pos++;
+    if (history_pos >= history_count) history_pos = history_count - 1;
+    
+    return history[history_pos % MAX_HISTORY];
 }
 
 // ==================== TIMER ====================
@@ -149,13 +353,6 @@ void init_timer(uint32_t frequency) {
     print("Timer initialized\n");
 }
 
-void sleep(uint32_t ticks) {
-    uint32_t target = timer_ticks + ticks;
-    while (timer_ticks < target) {
-        __asm__ volatile("hlt");
-    }
-}
-
 // ==================== FAT STRUCTURES ====================
 typedef struct {
     uint8_t name[8];
@@ -168,7 +365,17 @@ typedef struct {
     uint32_t size;
 } __attribute__((packed)) fat_entry_t;
 
-#define ATTR_DIRECTORY  0x10
+typedef struct {
+    uint8_t order;
+    uint16_t name1[5];
+    uint8_t attr;
+    uint8_t type;
+    uint8_t checksum;
+    uint16_t name2[6];
+    uint16_t first_cluster;
+    uint16_t name3[2];
+} __attribute__((packed)) vfat_entry_t;
+
 #define ATTR_ARCHIVE    0x20
 
 // ==================== FAT STATE ====================
@@ -186,7 +393,8 @@ static char current_path[256] = "/";
 // ==================== ATA ====================
 int ata_read(uint32_t lba, uint8_t* buf) {
     for (int i = 0; i < 1000; i++) {
-        if ((inb(0x1F7) & 0xC0) == 0x40) break;
+
+		if ((inb(0x1F7) & 0xC0) == 0x40) break;
     }
     outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
     outb(0x1F2, 1);
@@ -274,6 +482,39 @@ static uint16_t fat_alloc_cluster(void) {
     return 0;
 }
 
+// ==================== VFAT ДЛИННЫЕ ИМЕНА ====================
+int get_long_name(uint8_t* dir_sec, int start_entry, char* long_name) {
+    vfat_entry_t* v;
+    int entries_per_sector = bytes_per_sector / 32;
+    int pos = 0;
+    
+    for (int i = start_entry; i < entries_per_sector; i++) {
+        v = (vfat_entry_t*)(dir_sec + i * 32);
+        if (v->attr != ATTR_VFAT) break;
+        
+        int order = v->order & 0x3F;
+        if (order == 0) break;
+        
+        for (int j = 0; j < 5; j++) {
+            if (v->name1[j] && v->name1[j] != 0xFFFF) {
+                long_name[pos++] = v->name1[j] & 0xFF;
+            }
+        }
+        for (int j = 0; j < 6; j++) {
+            if (v->name2[j] && v->name2[j] != 0xFFFF) {
+                long_name[pos++] = v->name2[j] & 0xFF;
+            }
+        }
+        for (int j = 0; j < 2; j++) {
+            if (v->name3[j] && v->name3[j] != 0xFFFF) {
+                long_name[pos++] = v->name3[j] & 0xFF;
+            }
+        }
+    }
+    long_name[pos] = 0;
+    return pos;
+}
+
 // ==================== MOUNT ====================
 void mount(void) {
     uint8_t sec[512];
@@ -302,7 +543,7 @@ void mount(void) {
     }
 }
 
-// ==================== LS ====================
+// ==================== LS С ДЛИННЫМИ ИМЕНАМИ ====================
 void ls(void) {
     if (!mounted) { print("mount first\n"); return; }
     
@@ -310,6 +551,7 @@ void ls(void) {
     fat_entry_t* e;
     uint32_t dir_sector;
     int entries_per_sector = bytes_per_sector / 32;
+    char long_name[256];
     
     if (current_dir_cluster == 0) {
         dir_sector = root_sector;
@@ -321,16 +563,29 @@ void ls(void) {
     
     for (int i = 0; i < entries_per_sector; i++) {
         e = (fat_entry_t*)(sec + i * 32);
+        
+        if (e->attr == ATTR_VFAT) continue;
+        
         if (e->name[0] == 0) break;
         if (e->name[0] == 0xE5) continue;
+        
+        int has_long = 0;
+        if (i > 0 && ((vfat_entry_t*)(sec + (i-1) * 32))->attr == ATTR_VFAT) {
+            get_long_name(sec, i-1, long_name);
+            has_long = 1;
+        }
         
         if (e->attr & ATTR_DIRECTORY) set_color(COLOR_CYAN);
         else set_color(COLOR_GREY);
         
-        for (int j = 0; j < 8 && e->name[j] != ' '; j++) putchar(e->name[j]);
-        if (e->ext[0] != ' ') {
-            putchar('.');
-            for (int j = 0; j < 3 && e->ext[j] != ' '; j++) putchar(e->ext[j]);
+        if (has_long) {
+            print(long_name);
+        } else {
+            for (int j = 0; j < 8 && e->name[j] != ' '; j++) putchar(e->name[j]);
+            if (e->ext[0] != ' ') {
+                putchar('.');
+                for (int j = 0; j < 3 && e->ext[j] != ' '; j++) putchar(e->ext[j]);
+            }
         }
         
         if (e->attr & ATTR_DIRECTORY) print("  <DIR>");
@@ -647,7 +902,6 @@ void rm(const char* filename) {
         for (int j = 0; j < si; j++) {
             if (j >= fi || search[j] != fatname[j]) { match = 0; break; }
         }
-        
         if (match && si == fi) {
             e->name[0] = 0xE5;
             ata_write(dir_sector, sec);
@@ -730,6 +984,299 @@ void reboot(void) {
     __asm__ volatile("hlt");
 }
 
+// ==================== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ====================
+void env_set(const char* name, const char* value) {
+    for (int i = 0; i < env_count; i++) {
+        if (strcmp(env_names[i], name) == 0) {
+            strcpy(env_values[i], value);
+            return;
+        }
+    }
+    
+    if (env_count < MAX_ENV) {
+        strcpy(env_names[env_count], name);
+        strcpy(env_values[env_count], value);
+        env_count++;
+    }
+}
+
+const char* env_get(const char* name) {
+    for (int i = 0; i < env_count; i++) {
+        if (strcmp(env_names[i], name) == 0) {
+            return env_values[i];
+        }
+    }
+    return NULL;
+}
+
+void env_list(void) {
+    for (int i = 0; i < env_count; i++) {
+        print(env_names[i]);
+        print("=");
+        print(env_values[i]);
+        print("\n");
+    }
+}
+
+void export(const char* cmd) {
+    char name[ENV_NAME_LEN];
+    char value[ENV_VALUE_LEN];
+    int i = 0;
+    
+    while (*cmd == ' ') cmd++;
+    
+    while (*cmd && *cmd != '=' && i < ENV_NAME_LEN-1) {
+        name[i++] = *cmd++;
+    }
+    name[i] = 0;
+    
+    if (*cmd != '=') {
+        print("Use: export NAME=value\n");
+        return;
+    }
+    cmd++;
+    
+    i = 0;
+    while (*cmd && i < ENV_VALUE_LEN-1) {
+        value[i++] = *cmd++;
+    }
+    value[i] = 0;
+    
+    env_set(name, value);
+}
+
+// ==================== TAB-ДОПОЛНЕНИЕ ====================
+void tab_complete(char* cmd, int* pos) {
+    if (!mounted) return;
+    
+    uint8_t sec[512];
+    fat_entry_t* e;
+    uint32_t dir_sector;
+    int entries_per_sector = bytes_per_sector / 32;
+    char long_name[256];
+    char partial[256];
+    char matches[MAX_MATCHES][256];
+    int match_count = 0;
+    
+    if (current_dir_cluster == 0) {
+        dir_sector = root_sector;
+    } else {
+        dir_sector = data_sector + (current_dir_cluster - 2) * sectors_per_cluster;
+    }
+    
+    if (ata_read(dir_sector, sec)) return;
+    
+    strcpy(partial, cmd);
+    int len = strlen(partial);
+    
+    for (int i = 0; i < entries_per_sector && match_count < MAX_MATCHES; i++) {
+        e = (fat_entry_t*)(sec + i * 32);
+        if (e->attr == ATTR_VFAT) continue;
+        if (e->name[0] == 0) break;
+        if (e->name[0] == 0xE5) continue;
+        
+        char name[256];
+        int has_long = 0;
+        if (i > 0 && ((vfat_entry_t*)(sec + (i-1) * 32))->attr == ATTR_VFAT) {
+            get_long_name(sec, i-1, name);
+            has_long = 1;
+        } else {
+            int pos2 = 0;
+            for (int j = 0; j < 8 && e->name[j] != ' '; j++) name[pos2++] = e->name[j];
+            if (e->ext[0] != ' ') {
+                name[pos2++] = '.';
+                for (int j = 0; j < 3 && e->ext[j] != ' '; j++) name[pos2++] = e->ext[j];
+            }
+            name[pos2] = 0;
+        }
+        
+        if (strncmp(name, partial, len) == 0) {
+            strcpy(matches[match_count], name);
+            match_count++;
+        }
+    }
+    
+    if (match_count == 1) {
+        while (*pos > 0) {
+            (*pos)--;
+            putchar('\b');
+        }
+        for (int i = 0; matches[0][i]; i++) {
+            cmd[i] = matches[0][i];
+            putchar(matches[0][i]);
+        }
+        *pos = strlen(matches[0]);
+    } else if (match_count > 1) {
+        print("\n");
+        for (int i = 0; i < match_count; i++) {
+            print(matches[i]);
+            print("  ");
+        }
+        print("\n> ");
+        print(cmd);
+    }
+}
+
+// ==================== ГРАФИКА VESA ====================
+void vesa_init(void) {
+    __asm__ volatile (
+        "mov $0x4F02, %%ax\n"
+        "mov $0x13, %%bx\n"
+        "int $0x10"
+        : : : "ax", "bx"
+    );
+    print("VESA graphics mode enabled\n");
+}
+
+void vesa_putpixel(int x, int y, uint8_t color) {
+    uint8_t* vesa_mem = (uint8_t*)0xA0000;
+    vesa_mem[y * 320 + x] = color;
+}
+
+void vesa_clear(uint8_t color) {
+    uint8_t* vesa_mem = (uint8_t*)0xA0000;
+    for (int i = 0; i < 320 * 200; i++) {
+        vesa_mem[i] = color;
+    }
+}
+
+// ==================== ПАКЕТНЫЙ МЕНЕДЖЕР ====================
+void pkg_install(const char* pkg_name) {
+    print("Installing package: ");
+    print(pkg_name);
+    print("\n");
+    // TODO: скачивание и установка пакетов
+}
+
+void pkg_list(void) {
+    print("Available packages:\n");
+    print("  base     - Base system\n");
+    print("  dev      - Development tools\n");
+    print("  games    - Simple games\n");
+    print("  utils    - Utilities\n");
+}
+
+void pkg_remove(const char* pkg_name) {
+    print("Removing package: ");
+    print(pkg_name);
+    print("\n");
+    // TODO: удаление пакетов
+}
+
+// ==================== ЗВУК (PC SPEAKER) ====================
+void beep(int frequency, int duration) {
+    outb(0x61, inb(0x61) | 3);
+    
+    uint32_t div = 1193180 / frequency;
+    outb(0x43, 0xB6);
+    outb(0x42, div & 0xFF);
+    outb(0x42, (div >> 8) & 0xFF);
+    
+    for (volatile int i = 0; i < duration * 10000; i++);
+    
+    outb(0x61, inb(0x61) & 0xFC);
+}
+
+// ==================== РЕДАКТОР ТЕКСТА ====================
+void edit(const char* filename) {
+    print("\n=== EDITOR ===\n");
+    print("Ctrl+S - save, Ctrl+Q - quit\n");
+    
+    char buffer[4096];
+    int pos = 0;
+    
+    if (mounted) {
+        uint8_t sec[512];
+        fat_entry_t* e;
+        uint16_t cluster = 0;
+        uint32_t size = 0;
+        uint32_t dir_sector = (current_dir_cluster == 0) ? root_sector : 
+                              data_sector + (current_dir_cluster - 2) * sectors_per_cluster;
+        
+        if (ata_read(dir_sector, sec) == 0) {
+            char search[13];
+            int si = 0;
+            for (int i = 0; filename[i] && i < 12; i++) {
+                char c = filename[i];
+                if (c >= 'a' && c <= 'z') c -= 32;
+                search[si++] = c;
+            }
+            search[si] = 0;
+            
+            int entries_per_sector = bytes_per_sector / 32;
+            for (int i = 0; i < entries_per_sector; i++) {
+                e = (fat_entry_t*)(sec + i * 32);
+                if (e->name[0] == 0) break;
+                if (e->name[0] == 0xE5) continue;
+                
+                char fatname[13];
+                int fi = 0;
+                for (int j = 0; j < 8 && e->name[j] != ' '; j++) fatname[fi++] = e->name[j];
+                if (e->ext[0] != ' ') {
+                    fatname[fi++] = '.';
+                    for (int j = 0; j < 3 && e->ext[j] != ' '; j++) fatname[fi++] = e->ext[j];
+                }
+                fatname[fi] = 0;
+                
+                int match = 1;
+                for (int j = 0; j < si; j++) {
+                    if (j >= fi || search[j] != fatname[j]) { match = 0; break; }
+                }
+                if (match && si == fi) {
+                    cluster = e->cluster;
+                    size = e->size;
+                    break;
+                }
+            }
+        }
+        
+        if (cluster) {
+            uint32_t sector = data_sector + (cluster - 2) * sectors_per_cluster;
+            ata_read(sector, sec);
+            for (uint32_t i = 0; i < size && i < 4096; i++) {
+                buffer[i] = sec[i];
+            }
+            pos = size;
+            print(buffer);
+        }
+    }
+    
+    while (1) {
+        char c = getchar();
+        
+        if (c == 0x13 && ctrl) {
+            if (!mounted) { print("\nNot mounted\n"); continue; }
+            uint16_t cluster = fat_alloc_cluster();
+            if (cluster) {
+                uint8_t data[512];
+                for (int i = 0; i < 512; i++) data[i] = 0;
+                for (int i = 0; i < pos && i < 512; i++) data[i] = buffer[i];
+                uint32_t sector = data_sector + (cluster - 2) * sectors_per_cluster;
+                ata_write(sector, data);
+                print("\nSaved\n");
+            }
+        }
+        else if (c == 0x11 && ctrl) {
+            print("\n");
+            break;
+        }
+        else if (c == '\b' && pos > 0) {
+            pos--;
+            putchar('\b');
+        }
+        else if (c >= ' ' && c <= '~' && pos < 4095) {
+            buffer[pos++] = c;
+            putchar(c);
+        }
+    }
+}
+
+// ==================== USB ====================
+void usb_init(void) {
+    print("USB Controller init...\n");
+    outb(0x64, 0xD4);
+}
+
 // ==================== MAIN ====================
 void kernel_main(void) {
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
@@ -740,11 +1287,23 @@ void kernel_main(void) {
     set_color(COLOR_GREEN);
     print("NedoOS Ultimate Edition\n");
     
+    // Инициализация виртуальных терминалов
+    vt_init();
+    
     // Инициализация таймера
     init_timer(100);
     
+    // Инициализация мыши
+    mouse_init();
+   
+	// Установка переменных окружения по умолчанию
+	env_set("PATH", "/");
+	env_set("HOME", "/");
+	env_set("USER", "user");
+
     set_color(COLOR_CYAN);
-    print("Commands: help, mount, ls, cat, cd, pwd, mkdir, rm, rmdir, write, echo, color, reboot, clear\n> ");
+    print("Commands: help, mount, ls, cat, cd, pwd, mkdir, rm, rmdir, write, echo, color, reboot, clear\n");
+    print("Alt+F1..F4 - switch terminals | Alt+Up/Down - history\n> ");
     
     char cmd[256];
     int pos = 0;
@@ -755,6 +1314,9 @@ void kernel_main(void) {
         if (c == '\n') {
             print("\n");
             cmd[pos] = 0;
+            
+            // Добавляем в историю
+            if (pos > 0) history_add(cmd);
             
             char* p = cmd;
             while (*p == ' ') p++;
@@ -774,7 +1336,34 @@ void kernel_main(void) {
                 print("  color   - show colors\n");
                 print("  reboot  - restart\n");
                 print("  clear   - clear screen\n");
+				print("  env     - list environment variables\n");
+				print("  export  - set environment variable\n");
+				print("  pkg     - package manager (list/install/remove)\n");
+				print("  vesa    - switch to graphics mode\n");
+				print("  beep    - make a beep\n");
+				print("  edit    - text editor\n");
             }
+			else if (strcmp(p, "env") == 0) {
+				env_list();
+			}
+			else if (p[0] == 'e' && p[1] == 'x' && p[2] == 'p' && p[3] == 'o' && p[4] == 'r' && p[5] == 't') {
+				export(p + 6);
+			}
+			else if (p[0] == 'p' && p[1] == 'k' && p[2] == 'g' && p[3] == ' ') {
+				if (strcmp(p+4, "list") == 0) pkg_list();
+				else if (strncmp(p+4, "install ", 8) == 0) pkg_install(p+12);
+				else if (strncmp(p+4, "remove ", 7) == 0) pkg_remove(p+11);
+				else print("Use: pkg list/install/remove\n");
+			}
+			else if (strcmp(p, "vesa") == 0) {
+				vesa_init();
+			}
+			else if (p[0] == 'b' && p[1] == 'e' && p[2] == 'e' && p[3] == 'p') {
+				beep(440, 10);
+			}
+			else if (p[0] == 'e' && p[1] == 'd' && p[2] == 'i' && p[3] == 't' && p[4] == ' ') {
+				edit(p + 5);
+			}
             else if (strcmp(p, "mount") == 0) mount();
             else if (strcmp(p, "ls") == 0) ls();
             else if (p[0] == 'c' && p[1] == 'a' && p[2] == 't') {
@@ -836,9 +1425,40 @@ void kernel_main(void) {
             pos--;
             putchar('\b');
         }
+        else if (c == 0x80) { // Alt+Up
+            const char* h = history_get_prev();
+            if (h) {
+                while (pos > 0) {
+                    pos--;
+                    putchar('\b');
+                }
+                for (int i = 0; h[i]; i++) {
+                    cmd[i] = h[i];
+                    putchar(h[i]);
+                }
+                pos = strlen(h);
+            }
+        }
+        else if (c == 0x81) { // Alt+Down
+            const char* h = history_get_next();
+            if (h) {
+                while (pos > 0) {
+                    pos--;
+                    putchar('\b');
+                }
+                for (int i = 0; h[i]; i++) {
+                    cmd[i] = h[i];
+                    putchar(h[i]);
+                }
+                pos = strlen(h);
+            }
+        }
         else if (c >= ' ' && c <= '~' && pos < 255) {
             cmd[pos++] = c;
             putchar(c);
         }
+		else if (c == '\t') {
+			tab_complete(cmd, &pos);
+		}
     }
 }
