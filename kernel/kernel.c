@@ -1,4 +1,4 @@
-// NedoOS - Мега-версия с виртуальными терминалами и мышью
+// NedoOS - Мега-версия с виртуальными терминалами, мышью и сетью
 #include <stdint.h>
 #include <stddef.h>
 
@@ -16,7 +16,6 @@
 #define ENV_NAME_LEN 32
 #define ENV_VALUE_LEN 128
 #define MAX_MATCHES 64
-#define ATTR_VFAT 0x0F
 
 static char env_names[MAX_ENV][ENV_NAME_LEN];
 static char env_values[MAX_ENV][ENV_VALUE_LEN];
@@ -24,6 +23,10 @@ static int env_count = 0;
 
 static char* tab_matches[MAX_MATCHES];
 static int tab_count = 0;
+
+// ==================== СЕТЕВЫЕ ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
+uint8_t my_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+uint32_t my_ip = 0x0A00020F; // 10.0.2.15 (QEMU default)
 
 // ==================== VGA ====================
 #define VGA_WIDTH 80
@@ -53,7 +56,7 @@ void newline(void) {
         for (int i = 0; i < (VGA_HEIGHT-1) * VGA_WIDTH; i++) {
             video[i] = video[i + VGA_WIDTH];
         }
-for (int i = (VGA_HEIGHT-1) * VGA_WIDTH; i < VGA_HEIGHT * VGA_WIDTH; i++) {
+        for (int i = (VGA_HEIGHT-1) * VGA_WIDTH; i < VGA_HEIGHT * VGA_WIDTH; i++) {
             video[i] = ' ' | (current_color << 8);
         }
         row = VGA_HEIGHT - 1;
@@ -124,7 +127,6 @@ void vt_init(void) {
         terminals[t].color = 0x07;
         terminals[t].pos = 0;
         terminals[t].cmd[0] = 0;
-        // Очищаем буфер
         for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
             terminals[t].buffer[i] = ' ' | (0x07 << 8);
         }
@@ -175,6 +177,8 @@ static int history_pos = -1;
 // Для мыши
 static int mouse_x = 40;
 static int mouse_y = 12;
+static int mouse_old_x = 40;
+static int mouse_old_y = 12;
 static int mouse_buttons = 0;
 static int mouse_present = 0;
 static uint16_t mouse_bg = 0;
@@ -185,29 +189,22 @@ char getchar(void) {
     while ((inb(KEY_STATUS) & 1) == 0);
     sc = inb(KEY_DATA);
     
-    // Alt
     if (sc == 0x38) { alt = 1; return 0; }
     if (sc == 0xB8) { alt = 0; return 0; }
-    // Ctrl
     if (sc == 0x1D) { ctrl = 1; return 0; }
     if (sc == 0x9D) { ctrl = 0; return 0; }
-    // Shift
     if (sc == 0x2A || sc == 0x36) { shift = 1; return 0; }
     if (sc == 0xAA || sc == 0xB6) { shift = 0; return 0; }
-    // Caps
     if (sc == 0x3A) { caps = !caps; return 0; }
     
-    // F1-F4 для переключения терминалов
-    if (sc == 0x3B && alt) { vt_switch(0); return 0; } // Alt+F1
-    if (sc == 0x3C && alt) { vt_switch(1); return 0; } // Alt+F2
-    if (sc == 0x3D && alt) { vt_switch(2); return 0; } // Alt+F3
-    if (sc == 0x3E && alt) { vt_switch(3); return 0; } // Alt+F4
+    if (sc == 0x3B && alt) { vt_switch(0); return 0; }
+    if (sc == 0x3C && alt) { vt_switch(1); return 0; }
+    if (sc == 0x3D && alt) { vt_switch(2); return 0; }
+    if (sc == 0x3E && alt) { vt_switch(3); return 0; }
     
-    // Стрелки для истории
-    if (sc == 0x48 && alt) return 0x80; // Alt+Up
-    if (sc == 0x50 && alt) return 0x81; // Alt+Down
+    if (sc == 0x48 && alt) return 0x80;
+    if (sc == 0x50 && alt) return 0x81;
     
-    // Tab
     if (sc == 0x0F) return '\t';
     
     if (sc & 0x80) return 0;
@@ -237,7 +234,6 @@ char getchar(void) {
 
 // ==================== MOUSE ====================
 void mouse_init(void) {
-    // Включение мыши
     outb(0x64, 0xA8);
     outb(0x64, 0x20);
     uint8_t status = inb(0x60);
@@ -245,11 +241,13 @@ void mouse_init(void) {
     outb(0x64, 0x60);
     outb(0x60, status);
     
-    // Включаем передачу данных мыши
     outb(0x64, 0xD4);
     outb(0x60, 0xF4);
     
     mouse_present = 1;
+    mouse_old_x = mouse_x;
+    mouse_old_y = mouse_y;
+    mouse_bg = video[mouse_y * VGA_WIDTH + mouse_x];
     print("Mouse initialized\n");
 }
 
@@ -261,13 +259,16 @@ void mouse_handler(void) {
     cycle = (cycle + 1) % 3;
     
     if (cycle == 0) {
-        // Восстанавливаем фон под курсором
-        video[mouse_y * VGA_WIDTH + mouse_x] = mouse_bg;
+        video[mouse_old_y * VGA_WIDTH + mouse_old_x] = mouse_bg;
         
-        // Обработка данных мыши
         mouse_buttons = mouse_data[0] & 7;
-        int dx = (int8_t)mouse_data[1];
-        int dy = -(int8_t)mouse_data[2];
+        int dx = (int)mouse_data[1];
+        if (mouse_data[1] & 0x80) dx -= 256;
+        int dy = -(int)mouse_data[2];
+        if (mouse_data[2] & 0x80) dy -= 256;
+        
+        mouse_old_x = mouse_x;
+        mouse_old_y = mouse_y;
         
         mouse_x += dx / 2;
         mouse_y += dy / 2;
@@ -277,9 +278,8 @@ void mouse_handler(void) {
         if (mouse_y < 0) mouse_y = 0;
         if (mouse_y >= VGA_HEIGHT) mouse_y = VGA_HEIGHT - 1;
         
-        // Сохраняем фон и рисуем курсор
         mouse_bg = video[mouse_y * VGA_WIDTH + mouse_x];
-        video[mouse_y * VGA_WIDTH + mouse_x] = 0xDB0F; // Белый квадрат
+        video[mouse_y * VGA_WIDTH + mouse_x] = 0xDB0F;
     }
 }
 
@@ -312,7 +312,6 @@ int strncmp(const char* a, const char* b, int n) {
 void history_add(const char* cmd) {
     if (cmd[0] == 0) return;
     
-    // Не добавляем дубликаты
     if (history_count > 0 && strcmp(history[history_count-1], cmd) == 0)
         return;
     
@@ -324,9 +323,6 @@ void history_add(const char* cmd) {
 const char* history_get_prev(void) {
     if (history_count == 0) return NULL;
     if (history_pos > 0) history_pos--;
-    if (history_pos < 0) history_pos = 0;
-    if (history_pos >= history_count) history_pos = history_count - 1;
-    
     return history[history_pos % MAX_HISTORY];
 }
 
@@ -334,7 +330,6 @@ const char* history_get_next(void) {
     if (history_count == 0) return NULL;
     history_pos++;
     if (history_pos >= history_count) history_pos = history_count - 1;
-    
     return history[history_pos % MAX_HISTORY];
 }
 
@@ -376,9 +371,6 @@ typedef struct {
     uint16_t name3[2];
 } __attribute__((packed)) vfat_entry_t;
 
-#define ATTR_ARCHIVE    0x20
-
-// ==================== FAT STATE ====================
 static int mounted = 0;
 static uint32_t root_sector = 0;
 static uint32_t fat_sector = 0;
@@ -393,8 +385,7 @@ static char current_path[256] = "/";
 // ==================== ATA ====================
 int ata_read(uint32_t lba, uint8_t* buf) {
     for (int i = 0; i < 1000; i++) {
-
-		if ((inb(0x1F7) & 0xC0) == 0x40) break;
+        if ((inb(0x1F7) & 0xC0) == 0x40) break;
     }
     outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
     outb(0x1F2, 1);
@@ -1145,7 +1136,6 @@ void pkg_install(const char* pkg_name) {
     print("Installing package: ");
     print(pkg_name);
     print("\n");
-    // TODO: скачивание и установка пакетов
 }
 
 void pkg_list(void) {
@@ -1160,7 +1150,6 @@ void pkg_remove(const char* pkg_name) {
     print("Removing package: ");
     print(pkg_name);
     print("\n");
-    // TODO: удаление пакетов
 }
 
 // ==================== ЗВУК (PC SPEAKER) ====================
@@ -1277,6 +1266,11 @@ void usb_init(void) {
     outb(0x64, 0xD4);
 }
 
+// ==================== СЕТЕВЫЕ ФУНКЦИИ (ПРОТОТИПЫ) ====================
+void network_init(void);
+void network_handler(void);
+void ping(const char* ip_str);
+
 // ==================== MAIN ====================
 void kernel_main(void) {
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
@@ -1285,37 +1279,34 @@ void kernel_main(void) {
     row = 0; col = 0;
     
     set_color(COLOR_GREEN);
-    print("NedoOS Ultimate Edition\n");
+    print("NedoOS Ultimate Edition with Network\n");
     
-    // Инициализация виртуальных терминалов
     vt_init();
-    
-    // Инициализация таймера
     init_timer(100);
-    
-    // Инициализация мыши
     mouse_init();
-   
-	// Установка переменных окружения по умолчанию
-	env_set("PATH", "/");
-	env_set("HOME", "/");
-	env_set("USER", "user");
+    usb_init();
+    network_init();
+    
+    env_set("PATH", "/");
+    env_set("HOME", "/");
+    env_set("USER", "user");
 
     set_color(COLOR_CYAN);
-    print("Commands: help, mount, ls, cat, cd, pwd, mkdir, rm, rmdir, write, echo, color, reboot, clear\n");
-    print("Alt+F1..F4 - switch terminals | Alt+Up/Down - history\n> ");
+    print("Commands: help, mount, ls, cat, cd, pwd, mkdir, rm, rmdir, write,\n");
+    print("         echo, color, reboot, clear, ping\n");
+    print("Alt+F1..F4 - terminals | Alt+Up/Down - history\n> ");
     
     char cmd[256];
     int pos = 0;
     
     while (1) {
         char c = getchar();
+        network_handler(); // проверяем сетевые пакеты
         
         if (c == '\n') {
             print("\n");
             cmd[pos] = 0;
             
-            // Добавляем в историю
             if (pos > 0) history_add(cmd);
             
             char* p = cmd;
@@ -1334,36 +1325,37 @@ void kernel_main(void) {
                 print("  write   - write file (write file.txt text)\n");
                 print("  echo    - print text\n");
                 print("  color   - show colors\n");
+                print("  ping    - ping IP address\n");
                 print("  reboot  - restart\n");
                 print("  clear   - clear screen\n");
-				print("  env     - list environment variables\n");
-				print("  export  - set environment variable\n");
-				print("  pkg     - package manager (list/install/remove)\n");
-				print("  vesa    - switch to graphics mode\n");
-				print("  beep    - make a beep\n");
-				print("  edit    - text editor\n");
+                print("  env     - list environment variables\n");
+                print("  export  - set environment variable\n");
+                print("  pkg     - package manager (list/install/remove)\n");
+                print("  vesa    - switch to graphics mode\n");
+                print("  beep    - make a beep\n");
+                print("  edit    - text editor\n");
             }
-			else if (strcmp(p, "env") == 0) {
-				env_list();
-			}
-			else if (p[0] == 'e' && p[1] == 'x' && p[2] == 'p' && p[3] == 'o' && p[4] == 'r' && p[5] == 't') {
-				export(p + 6);
-			}
-			else if (p[0] == 'p' && p[1] == 'k' && p[2] == 'g' && p[3] == ' ') {
-				if (strcmp(p+4, "list") == 0) pkg_list();
-				else if (strncmp(p+4, "install ", 8) == 0) pkg_install(p+12);
-				else if (strncmp(p+4, "remove ", 7) == 0) pkg_remove(p+11);
-				else print("Use: pkg list/install/remove\n");
-			}
-			else if (strcmp(p, "vesa") == 0) {
-				vesa_init();
-			}
-			else if (p[0] == 'b' && p[1] == 'e' && p[2] == 'e' && p[3] == 'p') {
-				beep(440, 10);
-			}
-			else if (p[0] == 'e' && p[1] == 'd' && p[2] == 'i' && p[3] == 't' && p[4] == ' ') {
-				edit(p + 5);
-			}
+            else if (strcmp(p, "env") == 0) {
+                env_list();
+            }
+            else if (p[0] == 'e' && p[1] == 'x' && p[2] == 'p' && p[3] == 'o' && p[4] == 'r' && p[5] == 't') {
+                export(p + 6);
+            }
+            else if (p[0] == 'p' && p[1] == 'k' && p[2] == 'g' && p[3] == ' ') {
+                if (strcmp(p+4, "list") == 0) pkg_list();
+                else if (strncmp(p+4, "install ", 8) == 0) pkg_install(p+12);
+                else if (strncmp(p+4, "remove ", 7) == 0) pkg_remove(p+11);
+                else print("Use: pkg list/install/remove\n");
+            }
+            else if (strcmp(p, "vesa") == 0) {
+                vesa_init();
+            }
+            else if (p[0] == 'b' && p[1] == 'e' && p[2] == 'e' && p[3] == 'p') {
+                beep(440, 10);
+            }
+            else if (p[0] == 'e' && p[1] == 'd' && p[2] == 'i' && p[3] == 't' && p[4] == ' ') {
+                edit(p + 5);
+            }
             else if (strcmp(p, "mount") == 0) mount();
             else if (strcmp(p, "ls") == 0) ls();
             else if (p[0] == 'c' && p[1] == 'a' && p[2] == 't') {
@@ -1402,6 +1394,9 @@ void kernel_main(void) {
             else if (p[0] == 'e' && p[1] == 'c' && p[2] == 'h' && p[3] == 'o') {
                 echo(p + 4);
             }
+            else if (p[0] == 'p' && p[1] == 'i' && p[2] == 'n' && p[3] == 'g' && p[4] == ' ') {
+                ping(p + 5);
+            }
             else if (strcmp(p, "color") == 0) color_test();
             else if (strcmp(p, "reboot") == 0) reboot();
             else if (strcmp(p, "clear") == 0) {
@@ -1425,7 +1420,7 @@ void kernel_main(void) {
             pos--;
             putchar('\b');
         }
-        else if (c == 0x80) { // Alt+Up
+        else if (c == 0x80) {
             const char* h = history_get_prev();
             if (h) {
                 while (pos > 0) {
@@ -1439,7 +1434,7 @@ void kernel_main(void) {
                 pos = strlen(h);
             }
         }
-        else if (c == 0x81) { // Alt+Down
+        else if (c == 0x81) {
             const char* h = history_get_next();
             if (h) {
                 while (pos > 0) {
@@ -1453,12 +1448,12 @@ void kernel_main(void) {
                 pos = strlen(h);
             }
         }
+        else if (c == '\t') {
+            tab_complete(cmd, &pos);
+        }
         else if (c >= ' ' && c <= '~' && pos < 255) {
             cmd[pos++] = c;
             putchar(c);
         }
-		else if (c == '\t') {
-			tab_complete(cmd, &pos);
-		}
     }
 }
