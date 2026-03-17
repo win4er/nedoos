@@ -1,6 +1,21 @@
-// NedoOS - Мега-версия с виртуальными терминалами, мышью и сетью
+#include "kernel.h"
+
+// Прототипы функций
+void path_join(char* dest, const char* a, const char* b);
+uint16_t fat_alloc_cluster(void);
+int ata_write(uint32_t lba, uint8_t* buf);
 #include <stdint.h>
+
+// Прототипы функций
+void path_join(char* dest, const char* a, const char* b);
+uint16_t fat_alloc_cluster(void);
+int ata_write(uint32_t lba, uint8_t* buf);
 #include <stddef.h>
+
+// Прототипы функций
+void path_join(char* dest, const char* a, const char* b);
+uint16_t fat_alloc_cluster(void);
+int ata_write(uint32_t lba, uint8_t* buf);
 
 // ==================== АТРИБУТЫ FAT ====================
 #define ATTR_READ_ONLY  0x01
@@ -20,13 +35,6 @@
 static char env_names[MAX_ENV][ENV_NAME_LEN];
 static char env_values[MAX_ENV][ENV_VALUE_LEN];
 static int env_count = 0;
-
-static char* tab_matches[MAX_MATCHES];
-static int tab_count = 0;
-
-// ==================== СЕТЕВЫЕ ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
-uint8_t my_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
-uint32_t my_ip = 0x0A00020F; // 10.0.2.15 (QEMU default)
 
 // ==================== VGA ====================
 #define VGA_WIDTH 80
@@ -348,6 +356,8 @@ void init_timer(uint32_t frequency) {
     print("Timer initialized\n");
 }
 
+// ==================== СЕТЕВЫЕ ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
+
 // ==================== FAT STRUCTURES ====================
 typedef struct {
     uint8_t name[8];
@@ -359,17 +369,6 @@ typedef struct {
     uint16_t cluster;
     uint32_t size;
 } __attribute__((packed)) fat_entry_t;
-
-typedef struct {
-    uint8_t order;
-    uint16_t name1[5];
-    uint8_t attr;
-    uint8_t type;
-    uint8_t checksum;
-    uint16_t name2[6];
-    uint16_t first_cluster;
-    uint16_t name3[2];
-} __attribute__((packed)) vfat_entry_t;
 
 static int mounted = 0;
 static uint32_t root_sector = 0;
@@ -402,110 +401,6 @@ int ata_read(uint32_t lba, uint8_t* buf) {
     return 0;
 }
 
-int ata_write(uint32_t lba, uint8_t* buf) {
-    for (int i = 0; i < 1000; i++) {
-        if ((inb(0x1F7) & 0xC0) == 0x40) break;
-    }
-    outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(0x1F2, 1);
-    outb(0x1F3, (uint8_t)lba);
-    outb(0x1F4, (uint8_t)(lba >> 8));
-    outb(0x1F5, (uint8_t)(lba >> 16));
-    outb(0x1F7, 0x30);
-    for (int i = 0; i < 1000; i++) {
-        if (inb(0x1F7) & 0x08) break;
-    }
-    for (int i = 0; i < 256; i++) {
-        outw(0x1F0, ((uint16_t*)buf)[i]);
-    }
-    return 0;
-}
-
-// ==================== PATH ====================
-void path_join(char* dest, const char* a, const char* b) {
-    int i = 0, j = 0;
-    while (a[i]) { dest[i] = a[i]; i++; }
-    if (i > 0 && dest[i-1] != '/') dest[i++] = '/';
-    while (b[j]) { dest[i++] = b[j++]; }
-    dest[i] = 0;
-}
-
-// ==================== FAT HELPERS ====================
-static uint16_t fat_get_next_cluster(uint16_t cluster) {
-    uint32_t fat_offset = cluster * 3 / 2;
-    uint32_t fat_sec = fat_sector + fat_offset / bytes_per_sector;
-    uint32_t fat_off = fat_offset % bytes_per_sector;
-    
-    uint8_t buf[512];
-    if (ata_read(fat_sec, buf)) return 0xFF8;
-    
-    if (cluster & 1) {
-        return (*(uint16_t*)(buf + fat_off) >> 4) & 0x0FFF;
-    } else {
-        return *(uint16_t*)(buf + fat_off) & 0x0FFF;
-    }
-}
-
-static void fat_set_next_cluster(uint16_t cluster, uint16_t next) {
-    uint32_t fat_offset = cluster * 3 / 2;
-    uint32_t fat_sec = fat_sector + fat_offset / bytes_per_sector;
-    uint32_t fat_off = fat_offset % bytes_per_sector;
-    
-    uint8_t buf[512];
-    ata_read(fat_sec, buf);
-    
-    if (cluster & 1) {
-        *(uint16_t*)(buf + fat_off) = (*(uint16_t*)(buf + fat_off) & 0x000F) | (next << 4);
-    } else {
-        *(uint16_t*)(buf + fat_off) = (*(uint16_t*)(buf + fat_off) & 0xF000) | next;
-    }
-    
-    ata_write(fat_sec, buf);
-}
-
-static uint16_t fat_alloc_cluster(void) {
-    for (uint16_t i = 2; i < 512; i++) {
-        if (fat_get_next_cluster(i) == 0) {
-            fat_set_next_cluster(i, 0xFF8);
-            return i;
-        }
-    }
-    return 0;
-}
-
-// ==================== VFAT ДЛИННЫЕ ИМЕНА ====================
-int get_long_name(uint8_t* dir_sec, int start_entry, char* long_name) {
-    vfat_entry_t* v;
-    int entries_per_sector = bytes_per_sector / 32;
-    int pos = 0;
-    
-    for (int i = start_entry; i < entries_per_sector; i++) {
-        v = (vfat_entry_t*)(dir_sec + i * 32);
-        if (v->attr != ATTR_VFAT) break;
-        
-        int order = v->order & 0x3F;
-        if (order == 0) break;
-        
-        for (int j = 0; j < 5; j++) {
-            if (v->name1[j] && v->name1[j] != 0xFFFF) {
-                long_name[pos++] = v->name1[j] & 0xFF;
-            }
-        }
-        for (int j = 0; j < 6; j++) {
-            if (v->name2[j] && v->name2[j] != 0xFFFF) {
-                long_name[pos++] = v->name2[j] & 0xFF;
-            }
-        }
-        for (int j = 0; j < 2; j++) {
-            if (v->name3[j] && v->name3[j] != 0xFFFF) {
-                long_name[pos++] = v->name3[j] & 0xFF;
-            }
-        }
-    }
-    long_name[pos] = 0;
-    return pos;
-}
-
 // ==================== MOUNT ====================
 void mount(void) {
     uint8_t sec[512];
@@ -534,7 +429,7 @@ void mount(void) {
     }
 }
 
-// ==================== LS С ДЛИННЫМИ ИМЕНАМИ ====================
+// ==================== LS ====================
 void ls(void) {
     if (!mounted) { print("mount first\n"); return; }
     
@@ -542,7 +437,6 @@ void ls(void) {
     fat_entry_t* e;
     uint32_t dir_sector;
     int entries_per_sector = bytes_per_sector / 32;
-    char long_name[256];
     
     if (current_dir_cluster == 0) {
         dir_sector = root_sector;
@@ -555,28 +449,16 @@ void ls(void) {
     for (int i = 0; i < entries_per_sector; i++) {
         e = (fat_entry_t*)(sec + i * 32);
         
-        if (e->attr == ATTR_VFAT) continue;
-        
         if (e->name[0] == 0) break;
         if (e->name[0] == 0xE5) continue;
-        
-        int has_long = 0;
-        if (i > 0 && ((vfat_entry_t*)(sec + (i-1) * 32))->attr == ATTR_VFAT) {
-            get_long_name(sec, i-1, long_name);
-            has_long = 1;
-        }
         
         if (e->attr & ATTR_DIRECTORY) set_color(COLOR_CYAN);
         else set_color(COLOR_GREY);
         
-        if (has_long) {
-            print(long_name);
-        } else {
-            for (int j = 0; j < 8 && e->name[j] != ' '; j++) putchar(e->name[j]);
-            if (e->ext[0] != ' ') {
-                putchar('.');
-                for (int j = 0; j < 3 && e->ext[j] != ' '; j++) putchar(e->ext[j]);
-            }
+        for (int j = 0; j < 8 && e->name[j] != ' '; j++) putchar(e->name[j]);
+        if (e->ext[0] != ' ') {
+            putchar('.');
+            for (int j = 0; j < 3 && e->ext[j] != ' '; j++) putchar(e->ext[j]);
         }
         
         if (e->attr & ATTR_DIRECTORY) print("  <DIR>");
@@ -708,244 +590,6 @@ void pwd(void) {
     print("\n");
 }
 
-// ==================== MKDIR ====================
-void mkdir(const char* dirname) {
-    if (!mounted) { print("mount first\n"); return; }
-    
-    while (*dirname == ' ') dirname++;
-    if (*dirname == 0) { print("Use: mkdir dirname\n"); return; }
-    
-    uint8_t sec[512];
-    fat_entry_t* e;
-    int free_entry = -1;
-    int entries_per_sector = bytes_per_sector / 32;
-    
-    uint32_t dir_sector = (current_dir_cluster == 0) ? root_sector : 
-                          data_sector + (current_dir_cluster - 2) * sectors_per_cluster;
-    
-    if (ata_read(dir_sector, sec)) return;
-    
-    for (int i = 0; i < entries_per_sector; i++) {
-        e = (fat_entry_t*)(sec + i * 32);
-        if (e->name[0] == 0 || e->name[0] == 0xE5) {
-            free_entry = i;
-            break;
-        }
-    }
-    
-    if (free_entry == -1) { print("Directory full\n"); return; }
-    
-    uint16_t new_cluster = fat_alloc_cluster();
-    if (new_cluster == 0) { print("No free clusters\n"); return; }
-    
-    e = (fat_entry_t*)(sec + free_entry * 32);
-    
-    for (int j = 0; j < 8; j++) e->name[j] = ' ';
-    for (int j = 0; j < 3; j++) e->ext[j] = ' ';
-    
-    int j = 0;
-    while (dirname[j] && j < 8) {
-        char c = dirname[j];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        e->name[j] = c;
-        j++;
-    }
-    
-    e->attr = ATTR_DIRECTORY;
-    e->cluster = new_cluster;
-    e->size = 0;
-    
-    ata_write(dir_sector, sec);
-    
-    uint8_t new_sec[512];
-    fat_entry_t* new_e;
-    
-    for (int i = 0; i < 512; i++) new_sec[i] = 0;
-    
-    new_e = (fat_entry_t*)new_sec;
-    new_e->name[0] = '.';
-    for (int j = 1; j < 8; j++) new_e->name[j] = ' ';
-    new_e->ext[0] = ' ';
-    new_e->attr = ATTR_DIRECTORY;
-    new_e->cluster = new_cluster;
-    
-    new_e = (fat_entry_t*)(new_sec + 32);
-    new_e->name[0] = '.';
-    new_e->name[1] = '.';
-    for (int j = 2; j < 8; j++) new_e->name[j] = ' ';
-    new_e->ext[0] = ' ';
-    new_e->attr = ATTR_DIRECTORY;
-    new_e->cluster = (current_dir_cluster == 0) ? 0 : current_dir_cluster;
-    
-    uint32_t new_sector = data_sector + (new_cluster - 2) * sectors_per_cluster;
-    ata_write(new_sector, new_sec);
-    
-    print("Directory created\n");
-}
-
-// ==================== WRITE ====================
-void write_file(const char* filename, const char* content) {
-    if (!mounted) { print("mount first\n"); return; }
-    
-    uint8_t sec[512];
-    fat_entry_t* e;
-    int free_entry = -1;
-    int entries_per_sector = bytes_per_sector / 32;
-    
-    uint32_t dir_sector = (current_dir_cluster == 0) ? root_sector : 
-                          data_sector + (current_dir_cluster - 2) * sectors_per_cluster;
-    
-    if (ata_read(dir_sector, sec)) return;
-    
-    for (int i = 0; i < entries_per_sector; i++) {
-        e = (fat_entry_t*)(sec + i * 32);
-        if (e->name[0] == 0 || e->name[0] == 0xE5) {
-            free_entry = i;
-            break;
-        }
-    }
-    
-    if (free_entry == -1) { print("Directory full\n"); return; }
-    
-    uint16_t cluster = fat_alloc_cluster();
-    if (cluster == 0) { print("No free clusters\n"); return; }
-    
-    e = (fat_entry_t*)(sec + free_entry * 32);
-    
-    for (int j = 0; j < 8; j++) e->name[j] = ' ';
-    for (int j = 0; j < 3; j++) e->ext[j] = ' ';
-    
-    int j = 0;
-    while (filename[j] && filename[j] != '.' && j < 8) {
-        char c = filename[j];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        e->name[j] = c;
-        j++;
-    }
-    
-    if (filename[j] == '.') {
-        j++;
-        int k = 0;
-        while (filename[j] && k < 3) {
-            char c = filename[j];
-            if (c >= 'a' && c <= 'z') c -= 32;
-            e->ext[k++] = c;
-            j++;
-        }
-    }
-    
-    e->attr = ATTR_ARCHIVE;
-    e->cluster = cluster;
-    
-    int size = 0;
-    while (content[size]) size++;
-    e->size = size;
-    
-    ata_write(dir_sector, sec);
-    
-    uint8_t data[512];
-    for (int i = 0; i < 512; i++) data[i] = 0;
-    for (int i = 0; i < size && i < 512; i++) data[i] = content[i];
-    
-    uint32_t data_sec = data_sector + (cluster - 2) * sectors_per_cluster;
-    ata_write(data_sec, data);
-    
-    print("File written\n");
-}
-
-// ==================== RM ====================
-void rm(const char* filename) {
-    if (!mounted) { print("mount first\n"); return; }
-    
-    uint8_t sec[512];
-    fat_entry_t* e;
-    int entries_per_sector = bytes_per_sector / 32;
-    
-    uint32_t dir_sector = (current_dir_cluster == 0) ? root_sector : 
-                          data_sector + (current_dir_cluster - 2) * sectors_per_cluster;
-    
-    if (ata_read(dir_sector, sec)) return;
-    
-    char search[13];
-    int si = 0;
-    for (int i = 0; filename[i] && i < 12; i++) {
-        char c = filename[i];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        search[si++] = c;
-    }
-    search[si] = 0;
-    
-    for (int i = 0; i < entries_per_sector; i++) {
-        e = (fat_entry_t*)(sec + i * 32);
-        if (e->name[0] == 0) break;
-        if (e->name[0] == 0xE5) continue;
-        
-        char fatname[13];
-        int fi = 0;
-        for (int j = 0; j < 8 && e->name[j] != ' '; j++) fatname[fi++] = e->name[j];
-        if (e->ext[0] != ' ') {
-            fatname[fi++] = '.';
-            for (int j = 0; j < 3 && e->ext[j] != ' '; j++) fatname[fi++] = e->ext[j];
-        }
-        fatname[fi] = 0;
-        
-        int match = 1;
-        for (int j = 0; j < si; j++) {
-            if (j >= fi || search[j] != fatname[j]) { match = 0; break; }
-        }
-        if (match && si == fi) {
-            e->name[0] = 0xE5;
-            ata_write(dir_sector, sec);
-            print("Deleted\n");
-            return;
-        }
-    }
-    print("Not found\n");
-}
-
-// ==================== RMDIR ====================
-void rmdir(const char* dirname) {
-    if (!mounted) { print("mount first\n"); return; }
-    
-    uint8_t sec[512];
-    fat_entry_t* e;
-    int entries_per_sector = bytes_per_sector / 32;
-    
-    uint32_t dir_sector = (current_dir_cluster == 0) ? root_sector : 
-                          data_sector + (current_dir_cluster - 2) * sectors_per_cluster;
-    
-    if (ata_read(dir_sector, sec)) return;
-    
-    char search[9];
-    int si = 0;
-    for (int i = 0; dirname[i] && i < 8; i++) {
-        char c = dirname[i];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        search[si++] = c;
-    }
-    search[si] = 0;
-    
-    for (int i = 0; i < entries_per_sector; i++) {
-        e = (fat_entry_t*)(sec + i * 32);
-        if (e->name[0] == 0) break;
-        if (e->name[0] == 0xE5) continue;
-        if (!(e->attr & ATTR_DIRECTORY)) continue;
-        
-        int match = 1;
-        for (int j = 0; j < si; j++) {
-            if (e->name[j] != search[j]) { match = 0; break; }
-        }
-        
-        if (match) {
-            e->name[0] = 0xE5;
-            ata_write(dir_sector, sec);
-            print("Directory removed\n");
-            return;
-        }
-    }
-    print("Directory not found\n");
-}
-
 // ==================== ECHO ====================
 void echo(const char* text) {
     while (*text == ' ') text++;
@@ -991,15 +635,6 @@ void env_set(const char* name, const char* value) {
     }
 }
 
-const char* env_get(const char* name) {
-    for (int i = 0; i < env_count; i++) {
-        if (strcmp(env_names[i], name) == 0) {
-            return env_values[i];
-        }
-    }
-    return NULL;
-}
-
 void env_list(void) {
     for (int i = 0; i < env_count; i++) {
         print(env_names[i]);
@@ -1034,101 +669,6 @@ void export(const char* cmd) {
     value[i] = 0;
     
     env_set(name, value);
-}
-
-// ==================== TAB-ДОПОЛНЕНИЕ ====================
-void tab_complete(char* cmd, int* pos) {
-    if (!mounted) return;
-    
-    uint8_t sec[512];
-    fat_entry_t* e;
-    uint32_t dir_sector;
-    int entries_per_sector = bytes_per_sector / 32;
-    char long_name[256];
-    char partial[256];
-    char matches[MAX_MATCHES][256];
-    int match_count = 0;
-    
-    if (current_dir_cluster == 0) {
-        dir_sector = root_sector;
-    } else {
-        dir_sector = data_sector + (current_dir_cluster - 2) * sectors_per_cluster;
-    }
-    
-    if (ata_read(dir_sector, sec)) return;
-    
-    strcpy(partial, cmd);
-    int len = strlen(partial);
-    
-    for (int i = 0; i < entries_per_sector && match_count < MAX_MATCHES; i++) {
-        e = (fat_entry_t*)(sec + i * 32);
-        if (e->attr == ATTR_VFAT) continue;
-        if (e->name[0] == 0) break;
-        if (e->name[0] == 0xE5) continue;
-        
-        char name[256];
-        int has_long = 0;
-        if (i > 0 && ((vfat_entry_t*)(sec + (i-1) * 32))->attr == ATTR_VFAT) {
-            get_long_name(sec, i-1, name);
-            has_long = 1;
-        } else {
-            int pos2 = 0;
-            for (int j = 0; j < 8 && e->name[j] != ' '; j++) name[pos2++] = e->name[j];
-            if (e->ext[0] != ' ') {
-                name[pos2++] = '.';
-                for (int j = 0; j < 3 && e->ext[j] != ' '; j++) name[pos2++] = e->ext[j];
-            }
-            name[pos2] = 0;
-        }
-        
-        if (strncmp(name, partial, len) == 0) {
-            strcpy(matches[match_count], name);
-            match_count++;
-        }
-    }
-    
-    if (match_count == 1) {
-        while (*pos > 0) {
-            (*pos)--;
-            putchar('\b');
-        }
-        for (int i = 0; matches[0][i]; i++) {
-            cmd[i] = matches[0][i];
-            putchar(matches[0][i]);
-        }
-        *pos = strlen(matches[0]);
-    } else if (match_count > 1) {
-        print("\n");
-        for (int i = 0; i < match_count; i++) {
-            print(matches[i]);
-            print("  ");
-        }
-        print("\n> ");
-        print(cmd);
-    }
-}
-
-// ==================== ГРАФИКА VESA ====================
-void vesa_init(void) {
-    __asm__ volatile (
-        "mov $0x4F02, %%ax\n"
-        "mov $0x13, %%bx\n"
-        "int $0x10"
-        : : : "ax", "bx"
-    );
-    print("VESA graphics mode enabled\n");
-}
-
-void vesa_putpixel(int x, int y, uint8_t color) {
-    uint8_t* vesa_mem = (uint8_t*)0xA0000;
-    vesa_mem[y * 320 + x] = color;
-}
-
-void vesa_clear(uint8_t color) {
-    uint8_t* vesa_mem = (uint8_t*)0xA0000;
-    for (int i = 0; i < 320 * 200; i++) {
-        vesa_mem[i] = color;
-    }
 }
 
 // ==================== ПАКЕТНЫЙ МЕНЕДЖЕР ====================
@@ -1266,6 +806,98 @@ void usb_init(void) {
     outb(0x64, 0xD4);
 }
 
+// ==================== PATH ====================
+void path_join(char* dest, const char* a, const char* b) {
+    int i = 0, j = 0;
+    while (a[i]) { dest[i] = a[i]; i++; }
+    if (i > 0 && dest[i-1] != '/') dest[i++] = '/';
+    while (b[j]) { dest[i++] = b[j++]; }
+    dest[i] = 0;
+}
+
+// ==================== FAT HELPERS ====================
+static uint16_t fat_get_next_cluster(uint16_t cluster) {
+    uint32_t fat_offset = cluster * 3 / 2;
+    uint32_t fat_sec = fat_sector + fat_offset / bytes_per_sector;
+    uint32_t fat_off = fat_offset % bytes_per_sector;
+    
+    uint8_t buf[512];
+    if (ata_read(fat_sec, buf)) return 0xFF8;
+    
+    if (cluster & 1) {
+        return (*(uint16_t*)(buf + fat_off) >> 4) & 0x0FFF;
+    } else {
+        return *(uint16_t*)(buf + fat_off) & 0x0FFF;
+    }
+}
+
+static void fat_set_next_cluster(uint16_t cluster, uint16_t next) {
+    uint32_t fat_offset = cluster * 3 / 2;
+    uint32_t fat_sec = fat_sector + fat_offset / bytes_per_sector;
+    uint32_t fat_off = fat_offset % bytes_per_sector;
+    
+    uint8_t buf[512];
+    ata_read(fat_sec, buf);
+    
+    if (cluster & 1) {
+        *(uint16_t*)(buf + fat_off) = (*(uint16_t*)(buf + fat_off) & 0x000F) | (next << 4);
+    } else {
+        *(uint16_t*)(buf + fat_off) = (*(uint16_t*)(buf + fat_off) & 0xF000) | next;
+    }
+    
+    ata_write(fat_sec, buf);
+}
+
+uint16_t fat_alloc_cluster(void) {
+    for (uint16_t i = 2; i < 512; i++) {
+        if (fat_get_next_cluster(i) == 0) {
+            fat_set_next_cluster(i, 0xFF8);
+            return i;
+        }
+    }
+    return 0;
+}
+
+int ata_write(uint32_t lba, uint8_t* buf) {
+    for (int i = 0; i < 1000; i++) {
+        if ((inb(0x1F7) & 0xC0) == 0x40) break;
+    }
+    outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(0x1F2, 1);
+    outb(0x1F3, (uint8_t)lba);
+    outb(0x1F4, (uint8_t)(lba >> 8));
+    outb(0x1F5, (uint8_t)(lba >> 16));
+    outb(0x1F7, 0x30);
+    for (int i = 0; i < 1000; i++) {
+        if (inb(0x1F7) & 0x08) break;
+    }
+    for (int i = 0; i < 256; i++) {
+        outw(0x1F0, ((uint16_t*)buf)[i]);
+    }
+    return 0;
+}
+
+// ==================== MKDIR, WRITE, RM, RMDIR ====================
+void mkdir(const char* dirname) {
+    if (!mounted) { print("mount first\n"); return; }
+    print("MKDIR not fully implemented\n");
+}
+
+void write_file(const char* filename, const char* content) {
+    if (!mounted) { print("mount first\n"); return; }
+    print("WRITE not fully implemented\n");
+}
+
+void rm(const char* filename) {
+    if (!mounted) { print("mount first\n"); return; }
+    print("RM not fully implemented\n");
+}
+
+void rmdir(const char* dirname) {
+    if (!mounted) { print("mount first\n"); return; }
+    print("RMDIR not fully implemented\n");
+}
+
 // ==================== СЕТЕВЫЕ ФУНКЦИИ (ПРОТОТИПЫ) ====================
 void network_init(void);
 void network_handler(void);
@@ -1292,8 +924,7 @@ void kernel_main(void) {
     env_set("USER", "user");
 
     set_color(COLOR_CYAN);
-    print("Commands: help, mount, ls, cat, cd, pwd, mkdir, rm, rmdir, write,\n");
-    print("         echo, color, reboot, clear, ping\n");
+    print("Commands: help, mount, ls, cat, cd, pwd, echo, color, reboot, clear, ping\n");
     print("Alt+F1..F4 - terminals | Alt+Up/Down - history\n> ");
     
     char cmd[256];
@@ -1301,7 +932,7 @@ void kernel_main(void) {
     
     while (1) {
         char c = getchar();
-        network_handler(); // проверяем сетевые пакеты
+        network_handler();
         
         if (c == '\n') {
             print("\n");
@@ -1319,42 +950,11 @@ void kernel_main(void) {
                 print("  cat     - view file\n");
                 print("  cd      - change directory\n");
                 print("  pwd     - print path\n");
-                print("  mkdir   - create directory\n");
-                print("  rm      - remove file\n");
-                print("  rmdir   - remove directory\n");
-                print("  write   - write file (write file.txt text)\n");
                 print("  echo    - print text\n");
                 print("  color   - show colors\n");
                 print("  ping    - ping IP address\n");
                 print("  reboot  - restart\n");
                 print("  clear   - clear screen\n");
-                print("  env     - list environment variables\n");
-                print("  export  - set environment variable\n");
-                print("  pkg     - package manager (list/install/remove)\n");
-                print("  vesa    - switch to graphics mode\n");
-                print("  beep    - make a beep\n");
-                print("  edit    - text editor\n");
-            }
-            else if (strcmp(p, "env") == 0) {
-                env_list();
-            }
-            else if (p[0] == 'e' && p[1] == 'x' && p[2] == 'p' && p[3] == 'o' && p[4] == 'r' && p[5] == 't') {
-                export(p + 6);
-            }
-            else if (p[0] == 'p' && p[1] == 'k' && p[2] == 'g' && p[3] == ' ') {
-                if (strcmp(p+4, "list") == 0) pkg_list();
-                else if (strncmp(p+4, "install ", 8) == 0) pkg_install(p+12);
-                else if (strncmp(p+4, "remove ", 7) == 0) pkg_remove(p+11);
-                else print("Use: pkg list/install/remove\n");
-            }
-            else if (strcmp(p, "vesa") == 0) {
-                vesa_init();
-            }
-            else if (p[0] == 'b' && p[1] == 'e' && p[2] == 'e' && p[3] == 'p') {
-                beep(440, 10);
-            }
-            else if (p[0] == 'e' && p[1] == 'd' && p[2] == 'i' && p[3] == 't' && p[4] == ' ') {
-                edit(p + 5);
             }
             else if (strcmp(p, "mount") == 0) mount();
             else if (strcmp(p, "ls") == 0) ls();
@@ -1367,37 +967,13 @@ void kernel_main(void) {
                 else cd("");
             }
             else if (strcmp(p, "pwd") == 0) pwd();
-            else if (p[0] == 'm' && p[1] == 'k' && p[2] == 'd' && p[3] == 'i' && p[4] == 'r') {
-                if (p[5] == ' ') mkdir(p + 6);
-                else print("Use: mkdir dirname\n");
-            }
-            else if (p[0] == 'r' && p[1] == 'm' && p[2] == ' ') {
-                rm(p + 3);
-            }
-            else if (p[0] == 'r' && p[1] == 'm' && p[2] == 'd' && p[3] == 'i' && p[4] == 'r' && p[5] == ' ') {
-                rmdir(p + 6);
-            }
-            else if (p[0] == 'w' && p[1] == 'r' && p[2] == 'i' && p[3] == 't' && p[4] == 'e' && p[5] == ' ') {
-                char* space = p + 6;
-                while (*space == ' ') space++;
-                char* filename = space;
-                while (*space && *space != ' ') space++;
-                if (*space) {
-                    *space = 0;
-                    space++;
-                    while (*space == ' ') space++;
-                    write_file(filename, space);
-                } else {
-                    print("Use: write filename text\n");
-                }
-            }
             else if (p[0] == 'e' && p[1] == 'c' && p[2] == 'h' && p[3] == 'o') {
                 echo(p + 4);
             }
+            else if (strcmp(p, "color") == 0) color_test();
             else if (p[0] == 'p' && p[1] == 'i' && p[2] == 'n' && p[3] == 'g' && p[4] == ' ') {
                 ping(p + 5);
             }
-            else if (strcmp(p, "color") == 0) color_test();
             else if (strcmp(p, "reboot") == 0) reboot();
             else if (strcmp(p, "clear") == 0) {
                 for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
@@ -1405,7 +981,13 @@ void kernel_main(void) {
                 }
                 row = 0; col = 0;
             }
-            else if (p[0]) {
+			else if (strcmp(p, "ifconfig") == 0) {
+				ifconfig();
+			}
+			else if (p[0] == 'n' && p[1] == 'c' && p[2] == ' ') {
+				netcat(p + 3);
+			}
+			else if (p[0]) {
                 set_color(COLOR_RED);
                 print("Unknown: ");
                 print(p);
@@ -1448,12 +1030,18 @@ void kernel_main(void) {
                 pos = strlen(h);
             }
         }
-        else if (c == '\t') {
-            tab_complete(cmd, &pos);
-        }
         else if (c >= ' ' && c <= '~' && pos < 255) {
             cmd[pos++] = c;
             putchar(c);
         }
+
     }
+}
+extern uint8_t my_mac[6];
+extern uint32_t my_ip;
+
+void print_hex(uint8_t val) {
+    const char* hex = "0123456789ABCDEF";
+    putchar(hex[val >> 4]);
+    putchar(hex[val & 0xF]);
 }

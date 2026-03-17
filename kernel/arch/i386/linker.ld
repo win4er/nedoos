@@ -4,27 +4,24 @@ SECTIONS
 {
     . = 1M;
 
-    /* Сначала мультизагрузочный заголовок */
+    /* Принудительно размещаем мультизагрузочный заголовок самым первым */
     .multiboot ALIGN(4) : {
-        *(.multiboot)
+        KEEP(*(.multiboot))
     }
 
-    /* Затем код */
-    .text ALIGN(4) : {
+    .text ALIGN(4K) : {
         *(.text)
     }
 
-    /* Данные */
-    .rodata ALIGN(4) : {
+    .rodata ALIGN(4K) : {
         *(.rodata)
     }
 
-    .data ALIGN(4) : {
+    .data ALIGN(4K) : {
         *(.data)
     }
 
-    /* BSS */
-    .bss ALIGN(4) : {
+    .bss ALIGN(4K) : {
         *(COMMON)
         *(.bss)
     }
